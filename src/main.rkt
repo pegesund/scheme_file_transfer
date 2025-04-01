@@ -6,7 +6,8 @@
          net/uri-codec
          racket/random
          net/url
-         net/http-client)
+         net/http-client
+         openssl)
 
 (provide (all-defined-out))
 
@@ -103,19 +104,35 @@
   (let ([path-str (path->string path)])
     (regexp-match? #rx"/.git(/|$)" path-str)))
 
-;; Check if a path is within a specified subdirectory
+;; Function to check if a path is inside the specified directory
 (define (path-has-prefix? path prefix)
-  (if prefix
-      (let ([path-str (path->string path)]
-            [prefix-str (if (string? prefix)
-                           prefix
-                           (path->string prefix))])
-        ;; Make sure prefix ends with a slash
-        (unless (string-suffix? "/" prefix-str)
-          (set! prefix-str (string-append prefix-str "/")))
-        ;; Check if path starts with the prefix
-        (string-prefix? prefix-str path-str))
-      #t))  ; If no prefix specified, all paths match
+  ;; If no prefix, all paths match
+  (if (not prefix)
+      #t
+      ;; If we have a prefix, check if this path is in the expected directory
+      (let* ([prefix-path (if (string? prefix)
+                             (string->path prefix)
+                             prefix)]
+             ;; Get the complete path of the prefix directory
+             [prefix-str (path->string prefix-path)])
+        
+        ;; Get string version of path
+        (define path-str (path->string path))
+        
+        ;; Make sure prefix is a directory that exists
+        (if (not (directory-exists? prefix-path))
+            (begin
+              (displayln (format "Warning: Directory ~a does not exist" prefix-str))
+              #f)
+            
+            ;; Check if path has the specified prefix
+            (let ([match? (regexp-match? (regexp (format "^~a(/|$)" (regexp-quote prefix-str))) path-str)])
+              
+              (when match?
+                (displayln (format "MATCHED: ~a is inside directory ~a" 
+                                  path-str prefix-str)))
+              
+              match?)))))
 
 ;; Process a directory recursively, excluding .git directories
 ;; Returns the list of modified files
@@ -130,18 +147,21 @@
           (set! modified-files (cons path modified-files)))))
     modified-files))
 
-;; Simplified HTTP POST implementation for netcat server
+;; HTTP/HTTPS POST implementation with minimal security validation
 (define (http-post url-string data headers)
   (define url (string->url url-string))
   (define host (url-host url))
-  (define port-no (or (url-port url) 80))
+  (define scheme (url-scheme url))
+  (define is-https? (equal? scheme "https"))
+  (define default-port (if is-https? 443 80))
+  (define port-no (or (url-port url) default-port))
   (define path (string-join 
                 (map (lambda (p) (path/param-path p))
                      (url-path url))
                 "/"
                 #:before-first "/"))
   
-  (displayln (format "Connecting to ~a:~a" host port-no))
+  (displayln (format "Connecting to ~a:~a using ~a" host port-no (if is-https? "HTTPS" "HTTP")))
   
   (with-handlers ([exn:fail? 
                    (lambda (e) 
@@ -151,9 +171,26 @@
                              '() 
                              (string->bytes/utf-8 (format "Error: ~a" (exn-message e)))))])
     
-    ;; Open TCP connection
+    ;; Open connection - either plain TCP or SSL depending on URL scheme
     (define-values (in out) 
-      (tcp-connect host port-no))
+      (if is-https?
+          ;; For HTTPS, create an SSL connection with minimal security validation
+          (let-values ([(raw-in raw-out) (tcp-connect host port-no)])
+            ;; Create SSL connection with no certificate validation for maximum compatibility
+            ;; 'auto selects the best version of TLS/SSL available
+            (define ctx (ssl-make-client-context 'auto))
+            ;; Disable certificate verification and hostname checking for maximum compatibility
+            (ssl-set-verify! ctx #f)
+            ;; Convert the TCP ports to SSL ports
+            (define-values (ssl-in ssl-out)
+              (ports->ssl-ports raw-in raw-out 
+                               #:mode 'connect 
+                               #:context ctx
+                               #:close-original? #t
+                               #:shutdown-on-close? #t))
+            (values ssl-in ssl-out))
+          ;; For HTTP, use regular TCP connection
+          (tcp-connect host port-no)))
     
     ;; Build the HTTP request headers
     (define http-request 
@@ -179,13 +216,24 @@
     (write-bytes data out)
     (flush-output out)
     
-    ;; For netcat testing, don't wait for a response
-    ;; as it might not send a proper response or close the connection
-    (displayln "Data sent successfully (not waiting for response)")
+    ;; Don't wait for a response to simplify the process
+    (displayln "Data sent successfully")
     
     ;; Close the connection
-    (close-output-port out)
-    (close-input-port in)
+    (displayln "Closing connection...")
+    ;; For HTTPS, we need to be more careful with port closing
+    (when is-https?
+      ;; Disable SSL verification errors during shutdown
+      (with-handlers ([exn:fail? (lambda (e) 
+                                  (displayln "Note: SSL shutdown warning (safe to ignore)"))])
+        ;; Flush any pending data before closing
+        (flush-output out)))
+    
+    ;; Close ports with exception handling to avoid SSL shutdown errors
+    (with-handlers ([exn:fail? (lambda (e) 
+                               (displayln "Note: Port closing warning (safe to ignore)"))])
+      (close-output-port out)
+      (close-input-port in))
     
     ;; Always return success
     (values 200
@@ -264,9 +312,11 @@
          (displayln (format "Uploading ~a files to ~a" (length modified-files) server-url))
          (upload-files modified-files server-url)
          (displayln "All uploads completed"))]
+      
       [destination
        (displayln (format "Copying ~a files to ~a" (length modified-files) destination))
        ;; Implement destination copying logic here
        ]
+      
       [else 
        (displayln "No upload or copy requested")])))

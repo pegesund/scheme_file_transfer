@@ -90,7 +90,7 @@
   ;; Test 3: With directory prefix filter 
   (displayln "\nTest 3: Using directory prefix filter")
   (displayln "===================================")
-  (displayln (format "Will upload only files in src/ directory modified since ~a" (get-test-date-str)))
+  (displayln (format "Will upload only files in 'petter' directory modified since ~a (should include petter/petter file only)" (get-test-date-str)))
   
   ;; Use a background thread with timeout for filtered sync
   (define done-evt3 (make-semaphore 0))
@@ -102,16 +102,16 @@
            (get-test-date-str)  
            #f  ; No destination directory
            "http://localhost:8080/uploadxml/uploadfile"  ; Server URL
-           (build-path current-dir "src"))  ; Only process files in src/ directory
+           (build-path current-dir "petter"))  ; Only process files in the petter subdirectory
      
      (semaphore-post done-evt3)))
   
-  ;; Wait for uploads to complete with a timeout
-  (define result3 (sync/timeout 30 done-evt3))
+  ;; Wait for uploads to complete with a shorter timeout
+  (define result3 (sync/timeout 10 done-evt3))
   
   (if result3
       (displayln "\nTest 3 completed successfully!")
-      (displayln "\nTest 3 timed out after 30 seconds"))
+      (displayln "\nTest 3 timed out after 10 seconds"))
   
   (displayln "\nAll tests completed. Check the server terminal for upload information"))
 
