@@ -104,35 +104,31 @@
   (let ([path-str (path->string path)])
     (regexp-match? #rx"/.git(/|$)" path-str)))
 
-;; Function to check if a path is inside the specified directory
+;; Function to check if a path matches the specified prefix
 (define (path-has-prefix? path prefix)
   ;; If no prefix, all paths match
   (if (not prefix)
       #t
-      ;; If we have a prefix, check if this path is in the expected directory
-      (let* ([prefix-path (if (string? prefix)
-                             (string->path prefix)
-                             prefix)]
-             ;; Get the complete path of the prefix directory
-             [prefix-str (path->string prefix-path)])
+      ;; If we have a prefix, check if path contains the prefix
+      (let* ([prefix-str (if (string? prefix)
+                            prefix
+                            (path->string prefix))]
+             ;; Get string version of path
+             [path-str (path->string path)])
         
-        ;; Get string version of path
-        (define path-str (path->string path))
+        ;; For better matching, always use forward slashes
+        (set! path-str (regexp-replace* #rx"\\\\" path-str "/"))
+        (set! prefix-str (regexp-replace* #rx"\\\\" prefix-str "/"))
         
-        ;; Make sure prefix is a directory that exists
-        (if (not (directory-exists? prefix-path))
-            (begin
-              (displayln (format "Warning: Directory ~a does not exist" prefix-str))
-              #f)
-            
-            ;; Check if path has the specified prefix
-            (let ([match? (regexp-match? (regexp (format "^~a(/|$)" (regexp-quote prefix-str))) path-str)])
-              
-              (when match?
-                (displayln (format "MATCHED: ~a is inside directory ~a" 
-                                  path-str prefix-str)))
-              
-              match?)))))
+        ;; Debug information
+        (displayln (format "Checking if '~a' matches prefix '~a'" path-str prefix-str))
+        
+        ;; Simple string matching - if the path contains the prefix
+        (let ([match? (string-contains? path-str prefix-str)])
+          (when match?
+            (displayln (format "MATCHED: ~a contains prefix ~a" 
+                              path-str prefix-str)))
+          match?))))
 
 ;; Process a directory recursively, excluding .git directories
 ;; Returns the list of modified files
