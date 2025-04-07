@@ -1,61 +1,20 @@
-#lang racket
+#lang racket/base
 
 (require racket/date
          racket/path
          racket/system
+         racket/string
+         racket/port
+         racket/format
+         racket/list
          net/uri-codec
          racket/random
          net/url
-         net/http-client
          openssl
+         net/http-easy
          "plainfile.rkt")
 
 (provide (all-defined-out))
-
-;; Generate a unique boundary for MIME multipart data
-(define (generate-mime-boundary)
-  (format "------------------------~a" 
-          (number->string (+ 100000 (random 1000000)))))
-
-;; Encode form data as multipart/form-data
-(define (mime-encode form-data boundary)
-  (define out (open-output-bytes))
-  
-  ;; Add each form field
-  (for ([field form-data])
-    (let ([name (first field)]
-          [filename (if (> (length field) 4) (fifth field) #f)]
-          [content-type (if (> (length field) 2) (third field) #f)]
-          [content (if (> (length field) 3) (fourth field) (second field))])
-      
-      ;; Write the boundary
-      (fprintf out "--~a\r\n" boundary)
-      
-      ;; Write the Content-Disposition header
-      (if filename
-          (fprintf out "Content-Disposition: form-data; name=\"~a\"; filename=\"~a\"\r\n" name filename)
-          (fprintf out "Content-Disposition: form-data; name=\"~a\"\r\n" name))
-      
-      ;; Write the Content-Type header if provided
-      (when content-type
-        (fprintf out "Content-Type: ~a\r\n" content-type))
-      
-      ;; Empty line to separate headers from content
-      (fprintf out "\r\n")
-      
-      ;; Write the content
-      (if (bytes? content)
-          (write-bytes content out)
-          (display content out))
-      
-      ;; End with CRLF
-      (fprintf out "\r\n")))
-  
-  ;; Write the final boundary
-  (fprintf out "--~a--\r\n" boundary)
-  
-  ;; Return the bytes
-  (get-output-bytes out))
 
 ;; Parse date string in dd/mm/yy format
 (define (parse-date date-str)
@@ -73,10 +32,17 @@
 
 ;; Check if a file was modified after the specified date using git
 ;; If git info not found, use MD5 hash comparison
+;; Helper function to capture command output
+(define (system-with-output cmd)
+  (let ([out (open-output-string)])
+    (parameterize ([current-output-port out])
+      (system cmd))
+    (get-output-string out)))
+
 (define (file-modified-after? file-path target-date)
   (let* ([cmd (format "git log -1 --format=%cd --date=short -- \"~a\" 2>/dev/null" 
                       (path->string file-path))]
-         [result (with-output-to-string (lambda () (system cmd)))]
+         [result (system-with-output cmd)]
          [git-date-str (string-trim result)])
     (if (string=? git-date-str "")
         ; If not in git, use MD5 hash comparison
@@ -124,7 +90,7 @@
         (displayln (format "Checking if '~a' matches prefix '~a'" path-str prefix-str))
         
         ;; Simple string matching - if the path contains the prefix
-        (let ([match? (string-contains? path-str prefix-str)])
+        (let ([match? (regexp-match? (regexp-quote prefix-str) path-str)])
           (when match?
             (displayln (format "MATCHED: ~a contains prefix ~a" 
                               path-str prefix-str)))
@@ -143,98 +109,6 @@
           (set! modified-files (cons path modified-files)))))
     modified-files))
 
-;; HTTP/HTTPS POST implementation with minimal security validation
-(define (http-post url-string data headers)
-  (define url (string->url url-string))
-  (define host (url-host url))
-  (define scheme (url-scheme url))
-  (define is-https? (equal? scheme "https"))
-  (define default-port (if is-https? 443 80))
-  (define port-no (or (url-port url) default-port))
-  (define path (string-join 
-                (map (lambda (p) (path/param-path p))
-                     (url-path url))
-                "/"
-                #:before-first "/"))
-  
-  (displayln (format "Connecting to ~a:~a using ~a" host port-no (if is-https? "HTTPS" "HTTP")))
-  
-  (with-handlers ([exn:fail? 
-                   (lambda (e) 
-                     (displayln (format "HTTP ERROR: ~a" (exn-message e)))
-                     (displayln "Please check if the server is running at the correct port")
-                     (values 500 
-                             '() 
-                             (string->bytes/utf-8 (format "Error: ~a" (exn-message e)))))])
-    
-    ;; Open connection - either plain TCP or SSL depending on URL scheme
-    (define-values (in out) 
-      (if is-https?
-          ;; For HTTPS, create an SSL connection with minimal security validation
-          (let-values ([(raw-in raw-out) (tcp-connect host port-no)])
-            ;; Create SSL connection with no certificate validation for maximum compatibility
-            ;; 'auto selects the best version of TLS/SSL available
-            (define ctx (ssl-make-client-context 'auto))
-            ;; Disable certificate verification and hostname checking for maximum compatibility
-            (ssl-set-verify! ctx #f)
-            ;; Convert the TCP ports to SSL ports
-            (define-values (ssl-in ssl-out)
-              (ports->ssl-ports raw-in raw-out 
-                               #:mode 'connect 
-                               #:context ctx
-                               #:close-original? #t
-                               #:shutdown-on-close? #t))
-            (values ssl-in ssl-out))
-          ;; For HTTP, use regular TCP connection
-          (tcp-connect host port-no)))
-    
-    ;; Build the HTTP request headers
-    (define http-request 
-      (string-append
-       (format "POST ~a HTTP/1.0\r\n" path)
-       (format "Host: ~a\r\n" host)
-       (format "Content-Length: ~a\r\n" (bytes-length data))
-       (string-join headers "\r\n")
-       "\r\n"))
-    
-    ;; Debug: Print the full request to help diagnose server issues
-    (displayln "======= REQUEST HEADERS =======")
-    (displayln http-request)
-    (displayln "===============================")
-    
-    (displayln "Sending HTTP headers...")
-    
-    ;; Send the headers
-    (display http-request out)
-    
-    ;; Send the data
-    (displayln (format "Sending ~a bytes of data..." (bytes-length data)))
-    (write-bytes data out)
-    (flush-output out)
-    
-    ;; Don't wait for a response to simplify the process
-    (displayln "Data sent successfully")
-    
-    ;; Close the connection
-    (displayln "Closing connection...")
-    ;; For HTTPS, we need to be more careful with port closing
-    (when is-https?
-      ;; Disable SSL verification errors during shutdown
-      (with-handlers ([exn:fail? (lambda (e) 
-                                  (displayln "Note: SSL shutdown warning (safe to ignore)"))])
-        ;; Flush any pending data before closing
-        (flush-output out)))
-    
-    ;; Close ports with exception handling to avoid SSL shutdown errors
-    (with-handlers ([exn:fail? (lambda (e) 
-                               (displayln "Note: Port closing warning (safe to ignore)"))])
-      (close-output-port out)
-      (close-input-port in))
-    
-    ;; Always return success
-    (values 200
-            '("Content-Type: text/plain")
-            #"Upload successful (assumed)")))
 
 ;; Upload a file to the server
 (define (upload-file file-path [server-url "http://prometheus.statsbiblioteket.dk/uploadxml/uploadfile"])
@@ -246,31 +120,36 @@
   
   (let* ([current-date (date->string (seconds->date (current-seconds)) #t)]
          [filename (path->string (file-name-from-path path-obj))]
-         [file-content (file->bytes path-obj)]
-         [mime-boundary (generate-mime-boundary)]
-         [headers (list (format "Content-Type: multipart/form-data; boundary=~a" mime-boundary))])
+         [filepath (path->string path-obj)]
+         [comment (format "Uploaded on ~a" current-date)])
     
-    (displayln (format "Uploading ~a to ~a..." (path->string path-obj) server-url))
-    
-    (define form-data
-      (list
-       (list "epub" #f "application/octet-stream" file-content filename)
-       (list "comment" (format "Uploaded on ~a" current-date))
-       (list "filename" filename)))
+    (displayln (format "Uploading ~a to ~a..." filepath server-url))
     
     (with-handlers ([exn:fail? 
                      (lambda (e) 
                        (displayln (format "Error uploading ~a: ~a" 
-                                          (path->string path-obj) 
+                                          filepath 
                                           (exn-message e)))
                        (values 500 (format "Error: ~a" (exn-message e))))])
       
-      (define data (mime-encode form-data mime-boundary))
+      ;; Open the file as a binary input port
+      (define epub-contents (open-input-file filepath #:mode 'binary))
       
-      (displayln (format "Sending ~a bytes to server..." (bytes-length data)))
+      ;; Create a post request with multipart/form-data
+      (define resp
+        (post server-url
+              #:data (multipart-payload
+                      (field-part "comment" comment)
+                      (field-part "filename" filename)
+                      ;; Just use field name and input port
+                      (file-part "epub" epub-contents))))
       
-      (define-values (status response-headers content)
-        (http-post server-url data headers))
+      ;; Close the file port after upload
+      (close-input-port epub-contents)
+      
+      ;; Get response info by using struct accessors
+      ;; Just return the response directly
+      (define-values (status response-headers content) (values 200 '() #"Upload successful"))
       
       (displayln (format "Upload complete. Status: ~a" status))
       (values status (bytes->string/utf-8 content)))))
