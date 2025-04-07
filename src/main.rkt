@@ -7,7 +7,8 @@
          racket/random
          net/url
          net/http-client
-         openssl)
+         openssl
+         "plainfile.rkt")
 
 (provide (all-defined-out))
 
@@ -71,21 +72,19 @@
     (> t1 t2)))
 
 ;; Check if a file was modified after the specified date using git
+;; If git info not found, use MD5 hash comparison
 (define (file-modified-after? file-path target-date)
   (let* ([cmd (format "git log -1 --format=%cd --date=short -- \"~a\" 2>/dev/null" 
                       (path->string file-path))]
          [result (with-output-to-string (lambda () (system cmd)))]
          [git-date-str (string-trim result)])
     (if (string=? git-date-str "")
-        ; If not in git or no commits, fall back to file system date
-        (let* ([file-secs (file-or-directory-modify-seconds file-path)]
-               [file-date (seconds->date file-secs)]
-               [after? (date-after? file-date target-date)])
-          (displayln (format "~a: Not in git, using file system date ~a [~a target date]" 
+        ; If not in git, use MD5 hash comparison
+        (let ([changed? (process-file-md5 file-path)])
+          (displayln (format "~a: Not in git, using MD5 hash comparison [~a]" 
                              file-path 
-                             (date->string file-date)
-                             (if after? "AFTER" "BEFORE")))
-          after?)
+                             (if changed? "CHANGED" "UNCHANGED")))
+          changed?)
         ; Parse git date (format: YYYY-MM-DD)
         (let* ([date-parts (string-split git-date-str "-")]
                [year (string->number (list-ref date-parts 0))]
@@ -99,10 +98,11 @@
                              (if after? "AFTER" "BEFORE")))
           after?))))
 
-;; Check if path is in .git directory or git metadata
+;; Check if path is in .git directory or git metadata or the hash file
 (define (git-metadata-path? path)
   (let ([path-str (path->string path)])
-    (regexp-match? #rx"/.git(/|$)" path-str)))
+    (or (regexp-match? #rx"/.git(/|$)" path-str)
+        (regexp-match? #rx"/file-hashes.dat$" path-str))))
 
 ;; Function to check if a path matches the specified prefix
 (define (path-has-prefix? path prefix)
@@ -291,6 +291,10 @@
   (when dir-prefix
     (displayln (format "With directory prefix filter: ~a" dir-prefix)))
   
+  ;; Initialize the MD5 hash system with the root directory
+  (initialize-hash-system! directory)
+  
+  ;; Use the original process-directory function with the updated file-modified-after? function
   (let* ([target-date (parse-date date-str)]
          [modified-files (process-directory directory target-date dir-prefix)])
     
@@ -315,4 +319,7 @@
        ]
       
       [else 
-       (displayln "No upload or copy requested")])))
+       (displayln "No upload or copy requested")])
+    
+    ;; Save the hash table after processing
+    (save-hash-system!)))
